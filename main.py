@@ -8,14 +8,34 @@ from tqdm import tqdm
 import numpy as np
 from model import CREPEModel
 from data_loader import MDBStemSynth
+from torch.utils.data import DataLoader, SubsetRandomSampler
+import random
+
 
 # Hyperparameters
-BATCH_SIZE = 1  # Adjust based on GPU memory
+NUM_BATCHES_PER_EPOCH = 500
+BATCH_SIZE = 1
+NUM_SAMPLES_PER_EPOCH = NUM_BATCHES_PER_EPOCH * BATCH_SIZE  # 500 * 32 = 16000
 EPOCHS = 3
+NUM_VAL_SAMPLES = 4000
 LEARNING_RATE = 0.0002
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 PITCH_BINS = np.linspace(32.70, 1975.53, 360)  
+
+
+
+def create_sampler(dataset, num_samples, seed=None):
+    indices = list(range(len(dataset)))
+    if seed is not None:
+        random.Random(seed).shuffle(indices)
+    else:
+        random.shuffle(indices)
+    sampled_indices = indices[:num_samples]
+    sampler = SubsetRandomSampler(sampled_indices)
+    return sampler
+
+
 
 def to_local_average_cents(salience, center=None):
     """Find the weighted average cents near the argmax bin."""
@@ -85,14 +105,19 @@ def train_epoch(model, dataloader, criterion, optimizer):
     model.train()
     running_loss = 0.0
     rpa_total = 0.0
+    num_batches = 0
     for batch in tqdm(dataloader, desc="Training Epoch"):
+        if num_batches >= NUM_BATCHES_PER_EPOCH:
+            break
         loss, rpa = train_step(model, batch, criterion, optimizer)
         running_loss += loss
         rpa_total += rpa
+        num_batches += 1
 
-    epoch_loss = running_loss / len(dataloader)
-    epoch_rpa = rpa_total / len(dataloader)
+    epoch_loss = running_loss / NUM_BATCHES_PER_EPOCH
+    epoch_rpa = rpa_total / NUM_BATCHES_PER_EPOCH
     return epoch_loss, epoch_rpa
+
 
 def evaluate(model, dataloader, criterion):
     """Evaluates the model."""
@@ -141,8 +166,12 @@ def main():
         transform=None
     )
 
-    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+    train_sampler = create_sampler(train_dataset, NUM_SAMPLES_PER_EPOCH)
+    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler, num_workers=4)
+
+    VAL_SAMPLER_SEED = 42  
+    val_sampler = create_sampler(val_dataset, NUM_VAL_SAMPLES, seed=VAL_SAMPLER_SEED)
+    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, sampler=val_sampler, num_workers=4)
 
     print("Datasets loaded and prepared.")
     torch.cuda.empty_cache()
@@ -157,6 +186,7 @@ def main():
         print(f"Starting Epoch {epoch}...\n")
 
         train_loss, train_rpa = train_epoch(model, train_dataloader, criterion, optimizer)
+        print(f'Epoch {epoch}, Train Loss: {train_loss:.4f}, Train RPA: {train_rpa:.4f}')
         val_loss, val_rpa = evaluate(model, val_dataloader, criterion)
 
         print(f'Epoch {epoch}, Train Loss: {train_loss:.4f}, Train RPA: {train_rpa:.4f}, Val Loss: {val_loss:.4f}, Val RPA: {val_rpa:.4f}')
