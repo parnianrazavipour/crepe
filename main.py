@@ -1,203 +1,203 @@
-# main.py
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 import numpy as np
 from model import CREPEModel
 from data_loader import MDBStemSynth
-from torch.utils.data import DataLoader, SubsetRandomSampler
+import mir_eval
 import random
 
+torch.autograd.set_detect_anomaly(True)
 
-# Hyperparameters
 NUM_BATCHES_PER_EPOCH = 500
-BATCH_SIZE = 1
-NUM_SAMPLES_PER_EPOCH = NUM_BATCHES_PER_EPOCH * BATCH_SIZE  # 500 * 32 = 16000
-EPOCHS = 3
-NUM_VAL_SAMPLES = 4000
-LEARNING_RATE = 0.0002
+BATCH_SIZE = 32
+NUM_SAMPLES_PER_EPOCH = NUM_BATCHES_PER_EPOCH * BATCH_SIZE
+EPOCHS = 32
+LEARNING_RATE = 0.001
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+CENTS_PER_BIN = 20  # cents
+PITCH_BINS = np.linspace(32.70, 1975.53, 360)
+pitch_bins = torch.tensor(PITCH_BINS, dtype=torch.float32, device=DEVICE)
 
-PITCH_BINS = np.linspace(32.70, 1975.53, 360)  
+def evaluate_with_mir_eval(ground_truth_pitch, predicted_pitch):
+    """Evaluates RPA and RCA using mir_eval, taking into account voiced/unvoiced frames."""
+    # Prepare mir_eval inputs (remove NaNs and 0 values)
+    valid = ground_truth_pitch > 0
+    ref_voicing = valid.astype(float)  # 1 for voiced frames, 0 for unvoiced frames
+    est_voicing = (predicted_pitch > 0).astype(float)
+    
+    epsilon = 1e-6  # Small value to prevent log2(0)
+    predicted_pitch = np.maximum(predicted_pitch, epsilon)
 
+    # Convert the predicted pitch to cents
+    est_cent = 1200 * np.log2(predicted_pitch / 10)
+    
+    # Raw Pitch Accuracy (RPA) and Raw Chroma Accuracy (RCA)
+    rpa = mir_eval.melody.raw_pitch_accuracy(ref_voicing, ground_truth_pitch, est_voicing, est_cent , cent_tolerance=20)
+    rca = mir_eval.melody.raw_chroma_accuracy(ref_voicing, ground_truth_pitch, est_voicing, est_cent , cent_tolerance=20 )
+    
+    return rpa, rca
 
+def decode_weighted_average(logits, pitch_bins):
+    """Implements weighted average decoding using sigmoid probabilities."""
+    probs = logits
+    pitch_estimates = torch.sum(probs * pitch_bins, dim=1) / torch.clamp(torch.sum(probs, dim=1), min=1e-6)
+    return pitch_estimates
 
-def create_sampler(dataset, num_samples, seed=None):
-    indices = list(range(len(dataset)))
-    if seed is not None:
-        random.Random(seed).shuffle(indices)
-    else:
-        random.shuffle(indices)
-    sampled_indices = indices[:num_samples]
-    sampler = SubsetRandomSampler(sampled_indices)
-    return sampler
+def bins_to_frequency(bins):
+    return cents_to_frequency(bins_to_cents(bins))
 
+def bins_to_cents(bins):
+    cents = CENTS_PER_BIN * bins + 1997.3794084376191
+    return cents
 
-
-def to_local_average_cents(salience, center=None):
-    """Find the weighted average cents near the argmax bin."""
-    cents_mapping = np.linspace(0, 7180, 360) + 1997.3794084376191
-
-    if salience.ndim == 1:
-        if center is None:
-            center = int(np.argmax(salience))
-        start = max(0, center - 4)
-        end = min(len(salience), center + 5)
-        salience = salience[start:end]
-        product_sum = np.sum(salience * cents_mapping[start:end])
-        weight_sum = np.sum(salience)
-        return product_sum / weight_sum
-    else:
-        return np.array([to_local_average_cents(salience[i, :]) for i in range(salience.shape[0])])
-
-def calculate_pitch(prediction):
-    """Converts the 360-bin prediction (salience matrix) to a pitch estimate using local weighted average in cents."""
-    prediction_probs = prediction.detach().cpu().numpy() 
-    predicted_cents = np.array([to_local_average_cents(pred) for pred in prediction_probs])  
-
-    predicted_pitch = 10 * 2 ** (predicted_cents / 1200)
-    return torch.tensor(predicted_pitch).to(prediction.device)  
-
-def calculate_rpa(predicted_pitch, ground_truth_pitch, threshold_cents=50):
-    """Calculates Raw Pitch Accuracy (RPA) using a 50-cent threshold."""
-    pitch_diff = 1200 * torch.log2(predicted_pitch / ground_truth_pitch)
-    within_threshold = torch.abs(pitch_diff) <= threshold_cents
-    rpa = torch.mean(within_threshold.float()).item()
-    return rpa
+def cents_to_frequency(cents):
+    return 10 * 2 ** (cents / 1200)
 
 def train_step(model, batch, criterion, optimizer):
-    """Performs a single training step."""
-    audio = batch['audio'].float().to(DEVICE)  # Shape: (batch_size, 1024)
-    f0_values = batch['f0_values'].float().to(DEVICE)  # Shape: (batch_size, 360)
+    audio = batch['audio'].float().to(DEVICE)
+    f0_values = batch['f0_values'].float().to(DEVICE)
+
+    batch_size, seq_length, frame_length = audio.shape
+    audio = audio.view(-1, frame_length)
+    f0_values = f0_values.view(-1, f0_values.shape[-1])
+
+    optimizer.zero_grad()
 
     # Forward pass
-    optimizer.zero_grad()
     outputs = model(audio)
 
-    # Loss calculation
-    loss = criterion(outputs, f0_values)
-    loss.backward()
-
-    optimizer.step()
-
-    torch.cuda.empty_cache()
-
-
-    predicted_pitch = calculate_pitch(outputs)
+    # Use weighted average decoding
+    predicted_pitch = decode_weighted_average(outputs, pitch_bins)
 
     bin_indices = torch.argmax(f0_values, dim=1)
-    ground_truth_pitch = torch.tensor(PITCH_BINS)[bin_indices].to(DEVICE)
+    ground_truth_pitch = pitch_bins[bin_indices]
 
+    # Handle unvoiced frames (silence)
     unvoiced_mask = (f0_values.sum(dim=1) == 0)
-    ground_truth_pitch[unvoiced_mask] = 1e-6
-    rpa = calculate_rpa(predicted_pitch, ground_truth_pitch)
+    ground_truth_pitch[unvoiced_mask] = torch.tensor(0.0, device=DEVICE)
 
+    voiced_frames = ~unvoiced_mask
+    if voiced_frames.sum() > 0:
+        loss = criterion(outputs[voiced_frames], f0_values[voiced_frames])
+        loss.backward()
+        optimizer.step()
 
-    del audio, f0_values, outputs
+        rpa, rca = evaluate_with_mir_eval(
+            ground_truth_pitch[voiced_frames].detach().cpu().numpy(), 
+            predicted_pitch[voiced_frames].detach().cpu().numpy()
+        )
+    else:
+        loss = torch.tensor(0.0, device=DEVICE)
+        rpa, rca = 0.0, 0.0
 
-    return loss.item(), rpa
+    return loss.item(), rpa, rca
 
 def train_epoch(model, dataloader, criterion, optimizer):
-    """Performs one epoch of training."""
     model.train()
     running_loss = 0.0
     rpa_total = 0.0
+    rca_total = 0.0
     num_batches = 0
     for batch in tqdm(dataloader, desc="Training Epoch"):
         if num_batches >= NUM_BATCHES_PER_EPOCH:
             break
-        loss, rpa = train_step(model, batch, criterion, optimizer)
+        loss, rpa, rca = train_step(model, batch, criterion, optimizer)
         running_loss += loss
         rpa_total += rpa
+        rca_total += rca
         num_batches += 1
 
     epoch_loss = running_loss / NUM_BATCHES_PER_EPOCH
     epoch_rpa = rpa_total / NUM_BATCHES_PER_EPOCH
-    return epoch_loss, epoch_rpa
-
+    epoch_rca = rca_total / NUM_BATCHES_PER_EPOCH
+    return epoch_loss, epoch_rpa, epoch_rca
 
 def evaluate(model, dataloader, criterion):
-    """Evaluates the model."""
     model.eval()
     running_loss = 0.0
     rpa_total = 0.0
+    rca_total = 0.0
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
             audio = batch['audio'].float().to(DEVICE)
             f0_values = batch['f0_values'].float().to(DEVICE)
 
+            batch_size, seq_length, frame_length = audio.shape
+            audio = audio.view(-1, frame_length)
+            f0_values = f0_values.view(-1, f0_values.shape[-1])
+
             outputs = model(audio)
 
-            loss = criterion(outputs, f0_values)
-
-            predicted_pitch = calculate_pitch(outputs)
+            predicted_pitch = decode_weighted_average(outputs, pitch_bins)
 
             bin_indices = torch.argmax(f0_values, dim=1)
-            ground_truth_pitch = torch.tensor(PITCH_BINS)[bin_indices].to(DEVICE)
+            ground_truth_pitch = pitch_bins[bin_indices]
 
             unvoiced_mask = (f0_values.sum(dim=1) == 0)
-            ground_truth_pitch[unvoiced_mask] = 1e-6
+            ground_truth_pitch[unvoiced_mask] = torch.tensor(0.0, device=DEVICE)
 
-            rpa = calculate_rpa(predicted_pitch, ground_truth_pitch)
+            voiced_frames = ~unvoiced_mask
+            if voiced_frames.sum() > 0:
+                loss = criterion(outputs[voiced_frames], f0_values[voiced_frames])
+                rpa, rca = evaluate_with_mir_eval(ground_truth_pitch.cpu().numpy(), predicted_pitch.cpu().numpy())
+            else:
+                loss = torch.tensor(0.0, device=DEVICE)
+                rpa, rca = 0.0, 0.0
 
             running_loss += loss.item()
             rpa_total += rpa
+            rca_total += rca
 
     epoch_loss = running_loss / len(dataloader)
     epoch_rpa = rpa_total / len(dataloader)
-    return epoch_loss, epoch_rpa
+    epoch_rca = rca_total / len(dataloader)
+    return epoch_loss, epoch_rpa, epoch_rca
 
 def main():
+    if torch.cuda.is_available():
+        print("Running on GPU")
+    else:
+        print("Running on CPU")
+
     # Load Dataset
-    train_dataset = MDBStemSynth(
-        root='/home/ParnianRazavipour/mdb_stem_synth/MDB-stem-synth',
-        split="train",
-        step_size=10,
-        transform=None
-    )
+    root = '/home/ParnianRazavipour/mdb_stem_synth/MDB-stem-synth'
+    dataset = MDBStemSynth(root=root, split="train")
 
-    val_dataset = MDBStemSynth(
-        root='/home/ParnianRazavipour/mdb_stem_synth/MDB-stem-synth',
-        split="val",
-        step_size=10,
-        transform=None
-    )
+    print("Total dataset size:", len(dataset))
 
-    train_sampler = create_sampler(train_dataset, NUM_SAMPLES_PER_EPOCH)
-    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler, num_workers=4)
+    # Split dataset into train and validation sets (e.g., 80% train, 20% validation)
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
-    VAL_SAMPLER_SEED = 42  
-    val_sampler = create_sampler(val_dataset, NUM_VAL_SAMPLES, seed=VAL_SAMPLER_SEED)
-    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, sampler=val_sampler, num_workers=4)
+    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
 
-    print("Datasets loaded and prepared.")
-    torch.cuda.empty_cache()
+    
+    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=0)
 
     model = CREPEModel(capacity='full').to(DEVICE)
-
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     best_val_loss = float('inf')
     for epoch in range(1, EPOCHS + 1):
-        print(f"Starting Epoch {epoch}...\n")
+        print(f"Starting Epoch {epoch}...")
 
-        train_loss, train_rpa = train_epoch(model, train_dataloader, criterion, optimizer)
-        print(f'Epoch {epoch}, Train Loss: {train_loss:.4f}, Train RPA: {train_rpa:.4f}')
-        val_loss, val_rpa = evaluate(model, val_dataloader, criterion)
+        train_loss, train_rpa, train_rca = train_epoch(model, train_dataloader, criterion, optimizer)
+        print(f'Epoch {epoch}, Train Loss: {train_loss:.4f}, Train RPA: {train_rpa:.4f}, Train RCA: {train_rca:.4f}')
 
-        print(f'Epoch {epoch}, Train Loss: {train_loss:.4f}, Train RPA: {train_rpa:.4f}, Val Loss: {val_loss:.4f}, Val RPA: {val_rpa:.4f}')
+        val_loss, val_rpa, val_rca = evaluate(model, val_dataloader, criterion)
+        print(f'Epoch {epoch}, Val Loss: {val_loss:.4f}, Val RPA: {val_rpa:.4f}, Val RCA: {val_rca:.4f}')
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), 'best_model.pth')
-            print(f"Model saved at epoch {epoch} with validation loss {val_loss:.4f}.\n")
+            torch.save(model.state_dict(), f'best_model_epoch_{epoch}.pth')
+            print(f"Model saved at epoch {epoch} with validation loss {val_loss:.4f}.")
 
     print("Training complete.")
 
 if __name__ == '__main__':
     main()
-

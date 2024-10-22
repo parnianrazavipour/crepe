@@ -1,68 +1,77 @@
-# model.py
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import functools
+
 
 class CREPEModel(nn.Module):
+    """CREPE model definition, based on TorchCrepe architecture"""
+
     def __init__(self, capacity='full'):
         super(CREPEModel, self).__init__()
-        capacity_multiplier = {'tiny': 4, 'small': 8, 'medium': 16, 'large': 24, 'full': 32}[capacity]
 
-        # Convolutional layers
-        self.conv1 = nn.Conv2d(1, 32 * capacity_multiplier, kernel_size=(512, 1), stride=(4, 1), padding=(512 // 2, 0))
-        self.conv2 = nn.Conv2d(32 * capacity_multiplier, 4 * capacity_multiplier, kernel_size=(64, 1), stride=(1, 1), padding=(64 // 2, 0))
-        self.conv3 = nn.Conv2d(4 * capacity_multiplier, 4 * capacity_multiplier, kernel_size=(64, 1), stride=(1, 1), padding=(64 // 2, 0))
-        self.conv4 = nn.Conv2d(4 * capacity_multiplier, 4 * capacity_multiplier, kernel_size=(64, 1), stride=(1, 1), padding=(64 // 2, 0))
-        self.conv5 = nn.Conv2d(4 * capacity_multiplier, 8 * capacity_multiplier, kernel_size=(64, 1), stride=(1, 1), padding=(64 // 2, 0))
-        self.conv6 = nn.Conv2d(8 * capacity_multiplier, 16 * capacity_multiplier, kernel_size=(64, 1), stride=(1, 1), padding=(64 // 2, 0))
+        # Capacity configuration based on TorchCrepe model
+        if capacity == 'full':
+            in_channels = [1, 1024, 128, 128, 128, 256]
+            out_channels = [1024, 128, 128, 128, 256, 512]
+            self.in_features = 2048
+        elif capacity == 'tiny':
+            in_channels = [1, 128, 16, 16, 16, 32]
+            out_channels = [128, 16, 16, 16, 32, 64]
+            self.in_features = 256
+        else:
+            raise ValueError(f"Invalid model capacity: {capacity}")
 
-        # MaxPooling and Dropout
-        self.maxpool = nn.MaxPool2d((2, 1))
-        self.dropout = nn.Dropout(0.25)
-        self.flatten = nn.Flatten()
+        kernel_sizes = [(512, 1)] + 5 * [(64, 1)]
+        strides = [(4, 1)] + 5 * [(1, 1)]
 
-        # Fully connected layer
-        self.fc = nn.Linear(2048, 360)  # Adjust the input size accordingly
-        self.sigmoid = nn.Sigmoid()
+        # Batch norm with TorchCrepe's custom parameters
+        batch_norm_fn = functools.partial(torch.nn.BatchNorm2d, eps=0.001, momentum=0.0)
 
-        # Batch normalization layers
-        self.batchnorm1 = nn.BatchNorm2d(32 * capacity_multiplier)
-        self.batchnorm2 = nn.BatchNorm2d(4 * capacity_multiplier)
-        self.batchnorm3 = nn.BatchNorm2d(4 * capacity_multiplier)
-        self.batchnorm4 = nn.BatchNorm2d(4 * capacity_multiplier)
-        self.batchnorm5 = nn.BatchNorm2d(8 * capacity_multiplier)
-        self.batchnorm6 = nn.BatchNorm2d(16 * capacity_multiplier)
-    def forward(self, x):
-        # Input x shape: (batch_size, 1024)
-        x = x.unsqueeze(1).unsqueeze(3)  # Shape: (batch_size, 1, 1024, 1)
-        # No need to permute x
+        # Convolutional and batch norm layers
+        self.conv1 = nn.Conv2d(in_channels[0], out_channels[0], kernel_size=kernel_sizes[0], stride=strides[0])
+        self.conv1_BN = batch_norm_fn(num_features=out_channels[0])
 
-        # Apply convolutions, batch normalization, activations, pooling, and dropout
-        x = torch.relu(self.batchnorm1(self.conv1(x)))
-        x = self.maxpool(x)
-        x = self.dropout(x)
+        self.conv2 = nn.Conv2d(in_channels[1], out_channels[1], kernel_size=kernel_sizes[1], stride=strides[1])
+        self.conv2_BN = batch_norm_fn(num_features=out_channels[1])
 
-        x = torch.relu(self.batchnorm2(self.conv2(x)))
-        x = self.maxpool(x)
-        x = self.dropout(x)
+        self.conv3 = nn.Conv2d(in_channels[2], out_channels[2], kernel_size=kernel_sizes[2], stride=strides[2])
+        self.conv3_BN = batch_norm_fn(num_features=out_channels[2])
 
-        x = torch.relu(self.batchnorm3(self.conv3(x)))
-        x = self.maxpool(x)
-        x = self.dropout(x)
+        self.conv4 = nn.Conv2d(in_channels[3], out_channels[3], kernel_size=kernel_sizes[3], stride=strides[3])
+        self.conv4_BN = batch_norm_fn(num_features=out_channels[3])
 
-        x = torch.relu(self.batchnorm4(self.conv4(x)))
-        x = self.maxpool(x)
-        x = self.dropout(x)
+        self.conv5 = nn.Conv2d(in_channels[4], out_channels[4], kernel_size=kernel_sizes[4], stride=strides[4])
+        self.conv5_BN = batch_norm_fn(num_features=out_channels[4])
 
-        x = torch.relu(self.batchnorm5(self.conv5(x)))
-        x = self.maxpool(x)
-        x = self.dropout(x)
+        self.conv6 = nn.Conv2d(in_channels[5], out_channels[5], kernel_size=kernel_sizes[5], stride=strides[5])
+        self.conv6_BN = batch_norm_fn(num_features=out_channels[5])
 
-        x = torch.relu(self.batchnorm6(self.conv6(x)))
-        x = self.maxpool(x)
-        x = self.dropout(x)
+        self.classifier = nn.Linear(self.in_features, 360)  # Output 360 pitch bins
 
-        # Flatten and pass through fully connected layer with sigmoid
-        x = self.flatten(x)
-        x = self.sigmoid(self.fc(x))
-        return x  # Output shape: (batch_size, 360)
+    def forward(self, x, embed=False):
+        # Input reshape: (batch_size, 1, 1024, 1)
+        x = x[:, None, :, None]
+
+        x = self.layer(x, self.conv1, self.conv1_BN, (0, 0, 254, 254))
+        x = self.layer(x, self.conv2, self.conv2_BN)
+        x = self.layer(x, self.conv3, self.conv3_BN)
+        x = self.layer(x, self.conv4, self.conv4_BN)
+        x = self.layer(x, self.conv5, self.conv5_BN)
+
+        if embed:
+            return x
+
+        x = self.layer(x, self.conv6, self.conv6_BN)
+
+        x = x.permute(0, 2, 1, 3).reshape(-1, self.in_features)
+
+        return torch.sigmoid(self.classifier(x))
+
+    def layer(self, x, conv, batch_norm, padding=(0, 0, 31, 32)):
+        """Pass through one layer with custom padding, convolution, ReLU, batch norm, and max pooling"""
+        x = F.pad(x, padding)
+        x = conv(x)
+        x = F.relu(x)
+        x = batch_norm(x)
+        return F.max_pool2d(x, (2, 1), (2, 1))
