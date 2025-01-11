@@ -199,7 +199,8 @@ def weighted_average_pitch(logits, pitch_bins):
     return predicted_pitch
 
 def evaluate(model, dataloader, criterion):
-    # model.eval()
+    print("evaluate!")
+    model.eval()
     running_loss = 0.0
     rpa_total = 0.0
     rca_total = 0.0
@@ -275,7 +276,7 @@ def main():
     # Learning Rate Scheduler
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=scheduler_step, gamma=scheduler_gamma)
 
-    best_val_loss = float('inf')
+    best_val_rca = -float('inf')
     for epoch in range(1, EPOCHS + 1):
         print(f"\nStarting Epoch {epoch}/{EPOCHS}...")
 
@@ -285,14 +286,13 @@ def main():
         val_loss, val_rpa, val_rca = evaluate(model, val_dataloader, criterion)
         print(f'Epoch {epoch}, Val Loss: {val_loss:.4f}, Val RPA: {val_rpa:.4f}, Val RCA: {val_rca:.4f}')
 
-        # Step the scheduler
         scheduler.step()
 
         # Save the best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_rca > best_val_rca:
+            best_val_rca = val_rca
             torch.save(model.state_dict(), f'best_model_epoch_{epoch}.pth')
-            print(f"Model saved at epoch {epoch} with validation loss {val_loss:.4f}.")
+            print(f"Model saved at epoch {epoch} with validation RCA {val_rca:.4f}.")
 
     print("Training complete.")
 

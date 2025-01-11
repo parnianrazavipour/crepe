@@ -49,7 +49,7 @@ scheduler_gamma = 0.1
 
 
 
-MODEL_PATH = "best_model_epoch_19.pth"  
+MODEL_PATH = "best_model_epoch_9.pth"  
 
 # Load the dataset
 root = '/home/ParnianRazavipour/mdb_stem_synth/MDB-stem-synth'
@@ -65,7 +65,7 @@ model = CREPEModel(capacity='full').to(DEVICE)
 
 model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
 print(f"Model loaded from {MODEL_PATH}")
-
+model.eval()
 
 criterion = torch.nn.CrossEntropyLoss()
 
